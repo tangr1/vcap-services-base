@@ -54,6 +54,10 @@ namespace "test" do
     end
   end
 
+  def sh(cmd)
+    raise "Failed to run '#{cmd}'" unless system(cmd)
+  end
+
   task "spec" do |t|
     run_spec { sh "rake spec" }
   end
