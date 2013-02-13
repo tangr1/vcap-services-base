@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+set -x
+
+git clone --recursive git://github.com/cloudfoundry/warden.git vendor/warden
+./.warden.run
+bundle exec rake spec:ci --trace
