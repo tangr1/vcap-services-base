@@ -3,5 +3,23 @@ set -e
 set -x
 
 git clone --recursive git://github.com/cloudfoundry/warden.git vendor/warden
-./.warden.run
+
+# Close stdin
+exec 0>&-
+
+# Remove remnants of apparmor (specific to Travis VM)
+sudo dpkg --purge apparmor
+
+# Install dependencies
+sudo apt-get -y install debootstrap quota
+
+cd vendor/warden/warden
+bundle install
+rvmsudo bundle exec rake setup[config/linux.yml]
+rvmsudo bundle exec rake warden:start[config/linux.yml] &
+
+sleep 2
+echo "Assuming warden is ready, let's run the specs"
+
+cd ../../..
 bundle exec rake spec --trace
