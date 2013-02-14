@@ -15,3 +15,4 @@ sudo apt-get -y install debootstrap quota
 cd vendor/warden/warden
 bundle install
 rvmsudo bundle exec rake setup[config/linux.yml]
+nohup rvmsudo bundle exec rake warden:start[config/linux.yml] > /tmp/warden.out 2>&1 &
