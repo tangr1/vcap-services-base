@@ -15,11 +15,16 @@ sudo apt-get -y install debootstrap quota
 
 cd vendor/warden/warden
 bundle install
-rvmsudo bundle exec rake setup[config/linux.yml]
-rvmsudo bundle exec rake warden:start[config/linux.yml] &
+rvmsudo bundle exec env | sort
+rvmsudo bundle exec ruby -e "puts $LOAD_PATH.inspect"
+rvmsudo bundle exec gem list
+rvmsudo bundle list
 
-sleep 2
-echo "Assuming warden is ready, let's run the specs"
+#rvmsudo bundle exec rake setup[config/linux.yml]
+#rvmsudo bundle exec rake warden:start[config/linux.yml] &
 
-cd ../../..
-bundle exec rake spec --trace
+#sleep 2
+#echo "Assuming warden is ready, let's run the specs"
+
+#cd ../../..
+#bundle exec rake spec --trace
