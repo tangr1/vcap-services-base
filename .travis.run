@@ -16,8 +16,9 @@ sudo apt-get -y install debootstrap quota
 cd vendor/warden/warden
 bundle install
 rvmsudo bundle exec env | sort
-rvmsudo bundle exec ruby -e "puts $LOAD_PATH.inspect"
+rvmsudo bundle exec ruby -e 'puts $LOAD_PATH.inspect'
 rvmsudo bundle exec gem list
+rvmsudo bundle exec pwd
 rvmsudo bundle list
 
 #rvmsudo bundle exec rake setup[config/linux.yml]
