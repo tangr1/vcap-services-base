@@ -1226,4 +1226,109 @@ describe ProvisionerTests do
       EM.stop
     end
   end
+
+  describe "should support cluster setup" do
+    before :all do
+      @options = {
+        :service => {
+          :plans => {
+            "100" => {
+              "description" => "100",
+              "free" => true,
+            },
+            "100-c-gold" => {
+              "description" => "100-c-gold",
+              "free" => true,
+              "cluster_config" => {
+                "master" => {
+                  "plan" => "100",
+                  "count" => 1,
+                },
+                "slave" => {
+                  "plan" => "100",
+                  "count" => 1,
+                },
+              },
+            },
+          },
+        },
+      }
+    end
+
+    it "should be able to parse plan" do
+      provisioner = nil
+      EM.run do
+        provisioner = ProvisionerTests.create_provisioner @options
+        result = provisioner.parse_plan("100")
+        result.should == {"100" => { "count" => 1 }}
+        result = provisioner.parse_plan("100-c-gold")
+        result.should == {"100" => { "count" => 2 }}
+        expect {provisioner.parse_plan("invalid_plan")}.to raise_error /invalid_plan/
+        EM.stop
+      end
+    end
+
+    it "should provision multiple service instance" do
+      provisioner = nil
+      mock_nats = nil
+      EM.run do
+        provisioner = ProvisionerTests.create_provisioner @options
+        mock_nats = mock("test_mock_nats")
+        provisioner.nats = mock_nats
+        req = VCAP::Services::Api::GatewayProvisionRequest.new
+        req.label = "demo-1.0"
+        req.plan = "100-c-gold"
+        req.version = "1.0"
+        mock_nodes = {
+          "node-1" => {
+            "id" => "node-1",
+            "plan" => "free",
+            "available_capacity" => 200,
+            "capacity_unit" => 1,
+            "supported_versions" => ["1.0"],
+            "time" => Time.now.to_i
+          },
+          "node-2" => {
+            "id" => "node-2",
+            "plan" => "100",
+            "available_capacity" => 200,
+            "capacity_unit" => 1,
+            "supported_versions" => ["1.0"],
+            "time" => Time.now.to_i
+          },
+          "node-3" => {
+            "id" => "node-3",
+            "plan" => "100",
+            "available_capacity" => 200,
+            "capacity_unit" => 1,
+            "supported_versions" => ["1.0"],
+            "time" => Time.now.to_i
+          }
+        }
+        provisioner.nodes = mock_nodes
+        credentials = []
+        times = 0
+        mock_nats.should_receive(:request).with(any_args()).exactly(2).times.and_return { |*args, &cb|
+          times += 1
+          response = VCAP::Services::Internal::ProvisionResponse.new
+          response.success = true
+          credentials << response.credentials = {
+              "node_id" => "node-#{times}"
+          }
+          cb.call(response.encode)
+        }
+
+        provisioner.should_receive(:setup_cluster).and_return do |handles, plan_config, &blk|
+          blk.call(handles)
+        end
+
+        mock_nats.should_receive(:unsubscribe).twice.with(any_args())
+        provisioner.provision_service(req, nil) do |handles|
+          creds = handles.inject([]){|input, handle| input << handle[:credentials]}
+          creds.should match_array(credentials)
+        end
+        EM.stop
+      end
+    end
+  end
 end

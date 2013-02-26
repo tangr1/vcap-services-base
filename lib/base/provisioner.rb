@@ -59,6 +59,8 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     end if @node_nats
 
     EM.add_periodic_timer(60) { process_nodes }
+  rescue => e
+    puts "#{e.backtrace.join('|')}"
   end
 
   def create_redis(opt)
@@ -223,6 +225,7 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     if announce_message["id"]
       id = announce_message["id"]
       announce_message["time"] = Time.now.to_i
+      # Use correct capacity if the node has running provision tasks
       if @provision_refs[id] > 0
         announce_message['available_capacity'] = @nodes[id]['available_capacity']
       end
@@ -410,83 +413,112 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     end
   end
 
+  def parse_plan(plan)
+    plans_config = @opts[:service][:plans]
+    plan_config  = plans_config[plan]
+
+    raise "Can't find plan config for plan: #{plan}" unless plan_config
+    res = {}
+    cluster_config = plan_config["cluster_config"]
+    if cluster_config
+      cluster_config.each do |k, v|
+        node_plan = v["plan"]
+        res[node_plan] ||= {"count" => 0}
+        res[node_plan]["count"] += v["count"]
+      end
+    else
+      res[plan] = {"count" => 1}
+    end
+    res
+  end
+
   def provision_service(request, prov_handle=nil, &blk)
     @logger.debug("[#{service_description}] Attempting to provision instance (request=#{request.extract})")
     subscription = nil
     plan = request.plan || "free"
+    plan_config  = parse_plan(plan)
     version = request.version
+    svcs = []
+    best_nodes_per_plan = {}
+    node_count = 0
 
-    plan_nodes = @nodes.select{ |_, node| node["plan"] == plan}.values
-
-    @logger.debug("[#{service_description}] Picking version nodes from the following #{plan_nodes.count} \'#{plan}\' plan nodes: #{plan_nodes}")
-    if plan_nodes.count > 0
-      allow_over_provisioning = @plan_mgmt[plan.to_sym] && @plan_mgmt[plan.to_sym][:allow_over_provisioning] || false
+    plan_config.each do |name, config|
+      count = config["count"].to_i
+      plan_nodes = @nodes.select{ |_, node| node["plan"] == name }.values
+      raise "Cannot find matching node to provision the plan #{name}" unless plan_nodes.count >= count
 
       version_nodes = plan_nodes.select{ |node|
         node["supported_versions"] != nil && node["supported_versions"].include?(version)
       }
+      raise "Cannot find enough nodes to provision the version #{version}" unless version_nodes.count > 0
       @logger.debug("[#{service_description}] #{version_nodes.count} nodes allow provisioning for version: #{version}")
+      best_nodes = version_nodes.sort_by { |node| -(node_score(node)) }.take(count)
+      raise "Cannot find enough best nodes" unless best_nodes.size == count
 
-      if version_nodes.count > 0
-
-        best_node = version_nodes.max_by { |node| node_score(node) }
-
-        if best_node && ( allow_over_provisioning || node_score(best_node) > 0 )
-          best_node = best_node["id"]
-          @logger.debug("[#{service_description}] Provisioning on #{best_node}")
-
-          prov_req = ProvisionRequest.new
-          prov_req.plan = plan
-          prov_req.version = version
-          # use old credentials to provision a service if provided.
-          prov_req.credentials = prov_handle["credentials"] if prov_handle
-
-          @provision_refs[best_node] += 1
-          @nodes[best_node]['available_capacity'] -= @nodes[best_node]['capacity_unit']
-          subscription = nil
-
-          timer = EM.add_timer(@node_timeout) {
-            @provision_refs[best_node] -= 1
-            @node_nats.unsubscribe(subscription)
-            blk.call(timeout_fail)
-          }
-
-          subscription = @node_nats.request("#{service_name}.provision.#{best_node}", prov_req.encode) do |msg|
-            @provision_refs[best_node] -= 1
-            EM.cancel_timer(timer)
-            @node_nats.unsubscribe(subscription)
-            response = ProvisionResponse.decode(msg)
-
-            if response.success
-              @logger.debug("Successfully provision response:[#{response.inspect}]")
-
-              # credentials is not necessary in cache
-              prov_req.credentials = nil
-              credential = response.credentials
-              svc = {:configuration => prov_req.dup, :service_id => credential['name'], :credentials => credential}
-              @logger.debug("Provisioned: #{svc.inspect}")
-              @prov_svcs[svc[:service_id]] = svc
-              blk.call(success(svc))
-            else
-              blk.call(wrap_error(response))
-            end
-          end
-        else
-          # No resources
-          @logger.warn("[#{service_description}] Could not find a node to provision")
-          blk.call(internal_fail)
-        end
-      else
-        @logger.error("No available nodes supporting version #{version}")
-        blk.call(failure(ServiceError.new(ServiceError::UNSUPPORTED_VERSION, version)))
+      allow_over_provisioning = @plan_mgmt[plan.to_sym] && @plan_mgmt[plan.to_sym][:allow_over_provisioning] || false
+      unless allow_over_provisioning
+        raise "Cannot find enough nodes" unless node_score(best_nodes.last) > 0
       end
-    else
-      @logger.error("Unknown plan(#{plan})")
-      blk.call(failure(ServiceError.new(ServiceError::UNKNOWN_PLAN, plan)))
+      best_nodes_per_plan[name] = best_nodes
+      node_count += best_nodes.size
+    end
+
+    plan_config.each do |name, count|
+      best_nodes = best_nodes_per_plan[name]
+      best_nodes.each do |node|
+        node = node["id"]
+        @logger.debug("[#{service_description}] Provisioning on #{node}")
+
+        prov_req = ProvisionRequest.new
+        prov_req.plan = name
+        prov_req.version = version
+        # use old credentials to provision a service if provided.
+        # FIXME: not working for cluster instance
+        prov_req.credentials = prov_handle["credentials"] if prov_handle
+
+        @provision_refs[node] += 1
+        @nodes[node]["available_capacity"] -= @nodes[node]["capacity_unit"]
+        subscription = nil
+
+        timer = EM.add_timer(@node_timeout) {
+          @provision_refs[node] -= 1
+          @node_nats.unsubscribe(subscription)
+          blk.call(timeout_fail)
+        }
+
+        subscription = @node_nats.request("#{service_name}.provision.#{node}", prov_req.encode) do |msg|
+          @provision_refs[node] -= 1
+          EM.cancel_timer(timer)
+          @node_nats.unsubscribe(subscription)
+          response = ProvisionResponse.decode(msg)
+
+          if response.success
+            @logger.debug("Successfully provision response:[#{response.inspect}]")
+
+            # credentials is not necessary in cache
+            prov_req.credentials = nil
+            credentials = response.credentials
+            svc = {:configuration => prov_req.dup, :service_id => credentials["name"], :credentials => credentials}
+            svcs << svc
+            @logger.debug("Provisioned: #{svc.inspect}")
+            node_count -= 1
+            if node_count == 0
+              plan_config = @opts[:service][:plans][plan]
+              setup_cluster(svcs, plan_config, &blk)
+            end
+          else
+            # rollback
+          end
+        end
+      end
     end
   rescue => e
-    @logger.warn("Exception at provision_service #{e}")
+    @logger.warn("Exception at provision_service #{e} #{e.backtrace}")
     blk.call(internal_fail)
+  end
+
+  def setup_cluster(instances, plan_config, &blk)
+    blk.call(instances)
   end
 
   def bind_instance(instance_id, binding_options, bind_handle=nil, &blk)
