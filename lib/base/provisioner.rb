@@ -365,19 +365,17 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
 
   def unprovision_service(instance_id, &blk)
     @logger.debug("[#{service_description}] Unprovision service #{instance_id}")
-    begin
-      svc = @prov_svcs[instance_id]
-      @logger.debug("[#{service_description}] Unprovision service #{instance_id} found instance: #{svc}")
-      raise ServiceError.new(ServiceError::NOT_FOUND, "instance_id #{instance_id}") if svc.nil?
+    svc = @prov_svcs[instance_id]
+    @logger.debug("[#{service_description}] Unprovision service #{instance_id} found instance: #{svc}")
+    raise ServiceError.new(ServiceError::NOT_FOUND, "instance_id #{instance_id}") if svc.nil?
 
-      node_id = svc[:credentials]["node_id"]
-      raise "Cannot find node_id for #{instance_id}" if node_id.nil?
-
-      bindings = find_all_bindings(instance_id)
-      @logger.debug("[#{service_description}] Unprovisioning instance #{instance_id} from #{node_id}")
+    teardown_cluster(svc) if svc[:credentials]["slaves"]
+    svc[:credentials]["slaves"].each do |slave|
+      node_id = slave["node_id"]
+      @logger.debug("[#{service_description}] Unprovisioning slave instance #{slave["name"]} from #{node_id}")
       request = UnprovisionRequest.new
-      request.name = instance_id
-      request.bindings = bindings.map{|h| h[:credentials]}
+      request.name = slave["name"]
+      request.bindings = []
       @logger.debug("[#{service_description}] Sending request #{request}")
       subscription = nil
       timer = EM.add_timer(@node_timeout) {
@@ -387,29 +385,52 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
       subscription =
         @node_nats.request(
           "#{service_name}.unprovision.#{node_id}", request.encode
-       ) do |msg|
-          # Delete local entries
-          @prov_svcs.delete(instance_id)
-          bindings.each do |b|
-            @prov_svcs.delete(b[:service_id])
-          end
+      ) do |msg|
 
-          EM.cancel_timer(timer)
-          @node_nats.unsubscribe(subscription)
-          opts = SimpleResponse.decode(msg)
-          if opts.success
-            blk.call(success())
-          else
-            blk.call(wrap_error(opts))
-          end
-        end
-    rescue => e
-      if e.instance_of? ServiceError
-        blk.call(failure(e))
-      else
-        @logger.warn("Exception at unprovision_service #{e}")
-        blk.call(internal_fail)
+        EM.cancel_timer(timer)
+        @node_nats.unsubscribe(subscription)
+
+        opts = SimpleResponse.decode(msg)
+        @logger.error("[#{service_description}] failed to unprovision service #{slave["name"]}") unless opts.success
       end
+    end
+
+    node_id = svc[:credentials]["node_id"]
+    raise "Cannot find node_id for #{instance_id}" if node_id.nil?
+
+    bindings = find_all_bindings(instance_id)
+    @logger.debug("[#{service_description}] Unprovisioning instance #{instance_id} from #{node_id}")
+    request = UnprovisionRequest.new
+    request.name = instance_id
+    request.bindings = bindings.map{|h| h[:credentials]}
+    @logger.debug("[#{service_description}] Sending request #{request}")
+    subscription = nil
+    timer = EM.add_timer(@node_timeout) {
+      @node_nats.unsubscribe(subscription)
+      blk.call(timeout_fail)
+    }
+    subscription = @node_nats.request( "#{service_name}.unprovision.#{node_id}", request.encode) do |msg|
+      # Delete local entries
+      @prov_svcs.delete(instance_id)
+      bindings.each do |b|
+        @prov_svcs.delete(b[:service_id])
+      end
+
+      EM.cancel_timer(timer)
+      @node_nats.unsubscribe(subscription)
+      opts = SimpleResponse.decode(msg)
+      if opts.success
+        blk.call(success())
+      else
+        blk.call(wrap_error(opts))
+      end
+    end
+  rescue => e
+    if e.instance_of? ServiceError
+      blk.call(failure(e))
+    else
+      @logger.warn("Exception at unprovision_service #{e}")
+      blk.call(internal_fail)
     end
   end
 
@@ -436,13 +457,13 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     @logger.debug("[#{service_description}] Attempting to provision instance (request=#{request.extract})")
     subscription = nil
     plan = request.plan || "free"
-    plan_config  = parse_plan(plan)
+    config  = parse_plan(plan)
     version = request.version
     svcs = []
     best_nodes_per_plan = {}
     node_count = 0
 
-    plan_config.each do |name, config|
+    config.each do |name, config|
       count = config["count"].to_i
       plan_nodes = @nodes.select{ |_, node| node["plan"] == name }.values
       raise "Cannot find matching node to provision the plan #{name}" unless plan_nodes.count >= count
@@ -463,7 +484,7 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
       node_count += best_nodes.size
     end
 
-    plan_config.each do |name, count|
+    config.each do |name, count|
       best_nodes = best_nodes_per_plan[name]
       best_nodes.each do |node|
         node = node["id"]
@@ -503,11 +524,17 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
             @logger.debug("Provisioned: #{svc.inspect}")
             node_count -= 1
             if node_count == 0
-              plan_config = @opts[:service][:plans][plan]
-              setup_cluster(svcs, plan_config, &blk)
+              cluster_config = @opts[:service][:plans][plan]["cluster_config"]
+              if cluster_config
+                @logger.debug("Provisioned cluster instance: #{svc.inspect}")
+                svc = setup_cluster(svcs, cluster_config)
+              end
+              @prov_svcs[svc[:service_id]] = svc
+              blk.call(success(svc))
             end
           else
-            # rollback
+            # FIXME: rollback, need unprovision provisioned instances
+            blk.call(wrap_error(response))
           end
         end
       end
@@ -517,8 +544,22 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     blk.call(internal_fail)
   end
 
-  def setup_cluster(instances, plan_config, &blk)
-    blk.call(instances)
+  def setup_cluster(instances, cluster_config)
+  end
+
+  # Service Provisioner subclasses should override this method
+  # to setup service specific cluster
+  def setup_cluster(instances, cluster_config)
+    master = instances.first
+    slaves = instances - [instances.first]
+    master[:credentials]["slaves"] = slaves.inject([]) { |list, slave| list << slave[:credentials] }
+    master
+  end
+
+  # Service Provisioner subclasses should override this method
+  # to teardown service specific cluster
+  def teardown_cluster(svc)
+    true
   end
 
   def bind_instance(instance_id, binding_options, bind_handle=nil, &blk)

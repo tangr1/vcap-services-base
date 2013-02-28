@@ -1228,7 +1228,7 @@ describe ProvisionerTests do
   end
 
   describe "should support cluster setup" do
-    before :all do
+    before :each do
       @options = {
         :service => {
           :plans => {
@@ -1253,6 +1253,33 @@ describe ProvisionerTests do
           },
         },
       }
+
+      @mock_nodes = {
+        "node-1" => {
+          "id" => "node-1",
+          "plan" => "free",
+          "available_capacity" => 200,
+          "capacity_unit" => 1,
+          "supported_versions" => ["1.0"],
+          "time" => Time.now.to_i
+        },
+        "node-2" => {
+          "id" => "node-2",
+          "plan" => "100",
+          "available_capacity" => 200,
+          "capacity_unit" => 1,
+          "supported_versions" => ["1.0"],
+          "time" => Time.now.to_i
+        },
+        "node-3" => {
+          "id" => "node-3",
+          "plan" => "100",
+          "available_capacity" => 200,
+          "capacity_unit" => 1,
+          "supported_versions" => ["1.0"],
+          "time" => Time.now.to_i
+        }
+      }
     end
 
     it "should be able to parse plan" do
@@ -1268,7 +1295,7 @@ describe ProvisionerTests do
       end
     end
 
-    it "should provision multiple service instance" do
+    it "should provision multiple service instances" do
       provisioner = nil
       mock_nats = nil
       EM.run do
@@ -1279,53 +1306,50 @@ describe ProvisionerTests do
         req.label = "demo-1.0"
         req.plan = "100-c-gold"
         req.version = "1.0"
-        mock_nodes = {
-          "node-1" => {
-            "id" => "node-1",
-            "plan" => "free",
-            "available_capacity" => 200,
-            "capacity_unit" => 1,
-            "supported_versions" => ["1.0"],
-            "time" => Time.now.to_i
-          },
-          "node-2" => {
-            "id" => "node-2",
-            "plan" => "100",
-            "available_capacity" => 200,
-            "capacity_unit" => 1,
-            "supported_versions" => ["1.0"],
-            "time" => Time.now.to_i
-          },
-          "node-3" => {
-            "id" => "node-3",
-            "plan" => "100",
-            "available_capacity" => 200,
-            "capacity_unit" => 1,
-            "supported_versions" => ["1.0"],
-            "time" => Time.now.to_i
-          }
-        }
-        provisioner.nodes = mock_nodes
+        provisioner.nodes = @mock_nodes
         credentials = []
         times = 0
         mock_nats.should_receive(:request).with(any_args()).exactly(2).times.and_return { |*args, &cb|
           times += 1
           response = VCAP::Services::Internal::ProvisionResponse.new
           response.success = true
-          credentials << response.credentials = {
+          response.credentials = {
               "node_id" => "node-#{times}"
           }
+          credentials << response.credentials
           cb.call(response.encode)
         }
-
-        provisioner.should_receive(:setup_cluster).and_return do |handles, plan_config, &blk|
-          blk.call(handles)
-        end
-
         mock_nats.should_receive(:unsubscribe).twice.with(any_args())
-        provisioner.provision_service(req, nil) do |handles|
-          creds = handles.inject([]){|input, handle| input << handle[:credentials]}
-          creds.should match_array(credentials)
+
+        provisioner.provision_service(req, nil) do |result|
+          result["success"].should be_true
+          result["response"].should == {:configuration=>{:plan=>"100", :version=>"1.0"}, :service_id=>nil, :credentials=>{"node_id"=>"node-1", "slaves"=>[{"node_id"=>"node-2"}]}}
+        end
+        EM.stop
+      end
+    end
+
+    it "should unprovision multiple service instances" do
+      provisioner = nil
+      mock_nats = nil
+      EM.run do
+        provisioner = ProvisionerTests.create_provisioner @options
+        mock_nats = mock("test_mock_nats")
+        provisioner.nats = mock_nats
+        provisioner.nodes = @mock_nodes
+        credentials = []
+        times = 0
+        mock_nats.should_receive(:request).with(any_args()).exactly(2).times.and_return { |*args, &cb|
+          response = VCAP::Services::Internal::SimpleResponse.new
+          response.success = true
+          cb.call(response.encode)
+        }
+        mock_nats.should_receive(:unsubscribe).twice.with(any_args())
+
+        provisioner.prov_svcs = {}
+        provisioner.prov_svcs["instance1"] = {:configuration=>{:plan=>"100", :version=>"1.0"}, :service_id=>"instance1", :credentials=>{"node_id"=>"node-1", "name"=>"instance1", "slaves"=>[{"node_id"=>"node-2", "name"=>"instance2"}]}}
+        provisioner.unprovision_service("instance1") do |result|
+          result["success"].should be_true
         end
         EM.stop
       end
